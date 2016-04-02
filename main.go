@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -41,18 +42,81 @@ func (s *server) ReadDir(ctx context.Context, request *rfm.Request) (*rfm.DirInf
 		Items: make([]*rfm.FileInfo, len(fis)),
 	}
 	for i, fi := range fis {
-		owner, _ := getOwner(fi)
-		di.Items[i] = &rfm.FileInfo{
-			Name:    fi.Name(),
-			Size:    fi.Size(),
-			Mode:    uint32(fi.Mode()),
-			ModTime: float64(fi.ModTime().UnixNano()) * 1e-9,
-			IsDir:   fi.IsDir(),
-			Owner:   owner,
-		}
+		di.Items[i] = convertFileInfo(fi)
 	}
 	sort.Sort(byTypeThenName(di.Items))
 	return di, nil
+}
+
+func (s *server) Find(ctx context.Context, req *rfm.FindRequest) (*rfm.DirInfo, error) {
+	root := expandPath(req.BaseDir)
+	plen := len(root) + 1
+	var m matcher
+	if req.Name != "" {
+		m = newGlob(req.Name)
+	}
+
+	di := &rfm.DirInfo{
+		Path: root,
+	}
+	dirs := make(map[string]*rfm.FileInfo)
+	addWithParentDirs := func(r *rfm.FileInfo) {
+		stack := []*rfm.FileInfo{r}
+		var ok bool
+		for {
+			dir, _ := filepath.Split(r.Name)
+			if dir = strings.TrimSuffix(dir, string(os.PathSeparator)); dir != "" {
+				if r, ok = dirs[dir]; ok {
+					stack = append(stack, r)
+					delete(dirs, dir)
+					continue
+				}
+			}
+			break
+		}
+		for i := len(stack) - 1; i >= 0; i-- {
+			di.Items = append(di.Items, stack[i])
+		}
+	}
+
+	filepath.Walk(root, func(path string, fi os.FileInfo, err error) error {
+		if err != nil {
+			if os.IsPermission(err) {
+				return nil
+			}
+			return err
+		}
+		if len(path) < plen {
+			return nil
+		}
+
+		matched := m == nil || m.Match(fi.Name())
+		if !matched && !fi.IsDir() {
+			return nil
+		}
+		rfi := convertFileInfo(fi)
+		rfi.Name = path[plen:]
+		if matched {
+			addWithParentDirs(rfi)
+		} else {
+			dirs[rfi.Name] = rfi
+		}
+		return nil
+	})
+
+	return di, nil
+}
+
+func convertFileInfo(fi os.FileInfo) *rfm.FileInfo {
+	owner, _ := getOwner(fi)
+	return &rfm.FileInfo{
+		Name:    fi.Name(),
+		Size:    fi.Size(),
+		Mode:    uint32(fi.Mode()),
+		ModTime: float64(fi.ModTime().UnixNano()) * 1e-9,
+		IsDir:   fi.IsDir(),
+		Owner:   owner,
+	}
 }
 
 var uidCache = struct {
